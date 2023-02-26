@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include "endian.h"
 
 typedef uint8_t U8;
@@ -143,14 +146,28 @@ int main(int argc, char** argv)
     void* buf = malloc(sz+0x1000);
     fread(buf, 1, sz, f);
     fclose(f);
+
+    uint32_t archive_start = 0;
+    for (archive_start = 0; archive_start < sz; archive_start += 0x80)
+    {
+        if (getbe32((uint8_t*)((intptr_t)buf + archive_start)) == BIN_PACKAGE_HEADER_ID0) {
+            break;
+        }
+    }
+
+    uint32_t appimg_start = archive_start - 0x2000;
     
-    BININFO_HEADER* pInfo = (BININFO_HEADER*)((intptr_t)buf + 0x33080);
+    BININFO_HEADER* pInfo = (BININFO_HEADER*)((intptr_t)buf + archive_start);
 
     if (getbe32(pInfo->magic_1) != BIN_PACKAGE_HEADER_ID0 || getbe32(pInfo->magic_2) != BIN_PACKAGE_HEADER_ID1)
     {
-        printf("Invalid magic values at 0x2000: %08x %08x != %08x %08x\n", getbe32(pInfo->magic_1), getbe32(pInfo->magic_2), BIN_PACKAGE_HEADER_ID0, BIN_PACKAGE_HEADER_ID1);
+        printf("Invalid magic values at %08x: %08x %08x != %08x %08x\n", archive_start, getbe32(pInfo->magic_1), getbe32(pInfo->magic_2), BIN_PACKAGE_HEADER_ID0, BIN_PACKAGE_HEADER_ID1);
         return -1;
     }
+
+    mkdir("extract", 0700);
+
+    uint32_t earliest_addr = sz;
 
     for (int i = 0; i < getbe16(pInfo->some_num); i++)
     {
@@ -159,11 +176,14 @@ int main(int argc, char** argv)
         uint32_t f_len = getbe32(pInfo->aBinInfos[i].B_Len);
         uint8_t  comp_flags = pInfo->aBinInfos[i].B_IsComp;
 
-        printf("%04x %08x %08x %02x\n", id, f_addr, f_len, comp_flags);
+        if (f_addr < earliest_addr) {
+            earliest_addr = f_addr;
+        }
 
         snprintf(tmp, sizeof(tmp), "extract/%02u_%04x_%08x.bin", i, id, f_addr);
+        printf("ID %04x: addr=%08x len=%08x flags=%02x -> %s\n", id, f_addr, f_len, comp_flags, tmp);
 
-        printf("%08x\n", *(U32*)((intptr_t)buf + f_addr));
+        //printf("%08x\n", *(U32*)((intptr_t)buf + f_addr));
 
         uint32_t out_size = 0;
 
@@ -185,18 +205,38 @@ int main(int argc, char** argv)
             fwrite((void*)((intptr_t)buf + f_addr), 1, out_size, f);
             fclose(f);
         }
-        
     }
 
     uint32_t out_size;
-    uint32_t f_addr = 0x034880;
-    snprintf(tmp, sizeof(tmp), "extract/MAIN_%08x.bin", f_addr-0x3800);
+    uint32_t f_addr = archive_start+0x800;
+
+    while (*(uint32_t*)(buf + f_addr) == 0) {
+        f_addr += 0x80;
+    }
+    printf("And the main is at: 0x%x\n", f_addr);
+    snprintf(tmp, sizeof(tmp), "extract/MAIN_%08x.bin", appimg_start);
     void* buf_out = malloc(sz*4);
     MSDecompress_MemoryAllocatorInit(tmpbuf, MEMORY_POOL_SIZE);
     MsDecompress((U8*)((intptr_t)buf + f_addr), buf_out, sz-f_addr, sz*4, &out_size);
+    if (!out_size) {
+        printf("This is a weird one maybe, trying again but 0x800 forward...\n");
+
+        f_addr += 0x800;
+        MSDecompress_MemoryAllocatorInit(tmpbuf, MEMORY_POOL_SIZE);
+        MsDecompress((U8*)((intptr_t)buf + f_addr), buf_out, sz-f_addr, sz*4, &out_size);
+
+        if (out_size) {
+            printf("Yes! 0x%08x bytes.\n", out_size);
+        }
+    }
+
+    if (!out_size) {
+        f_addr = earliest_addr;
+        printf("Maybe it's uncompressed idk.\n");
+    }
 
     f = fopen(tmp, "wb");
-    fwrite((void*)((intptr_t)buf + 0x31080), 1, 0x3800, f);
+    fwrite((void*)((intptr_t)buf + appimg_start), 1, f_addr-appimg_start, f);
     fwrite(buf_out, 1, out_size, f);
     fclose(f);
 
